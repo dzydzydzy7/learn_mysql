@@ -344,6 +344,44 @@ key 字段为 a，表示优化器选择了索引 a。
 
 第三种方法是，在有些场景下，我们可以新建一个更合适的索引，来提供给优化器做选择，或删掉误用的索引。比如**直接把索引b删掉**。
 
+## 如何对字符串建索引
+
+也就是说使用前缀索引，定义好长度，就可以做到既节省空间，又不用额外增加太多的查询成本。
+
+首先，你可以使用下面这个语句，算出这个列上有多少个不同的值：
+
+```mysql
+select count(distinct email) as L from SUser;
+```
+
+然后，依次选取不同长度的前缀来看这个值，比如我们要看一下 4~7 个字节的前缀索引，可以用这个语句：
+
+```mysql
+select 
+	count(distinct left(email,4)）as L4, 
+    count(distinct left(email,5)）as L5, 
+    count(distinct left(email,6)）as L6, 
+    count(distinct left(email,7)）as L7,
+from SUser;
+```
+
+建立前缀索引
+
+```mysql
+alter table SUser add index index2(email(6));
+```
+
+遇到前缀相同的字符串时，前缀索引可能不适用，此时的解决方法：
+
+- 倒着存字符串，再使用前缀索引
+
+- 再加一个Hash字段，再对这个hash字段建索引
+
+  ```mysql
+  alter table t add id_card_crc int unsigned, add index(id_card_crc);
+  select field_list from t where id_card_crc=crc32('input_id_card_string') and id_card='input_id_card_string‘
+  ```
+
 # 锁
 
 ## 全局锁
