@@ -632,3 +632,77 @@ TABLE_ROWS 就是从这个采样估算得来的，因此它也很不准。有多
 
 **为什么count(1) 执行得要比 count(主键 id) 快**？因为从引擎返回 id 会涉及到解析数据行，以及拷贝字段值的操作。
 
+## Order By
+
+举例：
+
+```mysql
+CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `city` varchar(16) NOT NULL,
+  `name` varchar(16) NOT NULL,
+  `age` int(11) NOT NULL,
+  `addr` varchar(128) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `city` (`city`)
+) ENGINE=InnoDB;
+```
+
+explain这个语句:
+
+```mysql
+select city,name,age from t where city='杭州' order by name limit 1000;
+```
+
+![](image/31.png)
+
+Extra 这个字段中的“Using filesort”表示的就是需要排序，MySQL 会给每个线程分配一块内存用于排序，称为 sort_buffer。
+
+执行流程：
+
+<img src="image/32.png" style="zoom: 50%;" />
+
+1. 初始化 sort_buffer，确定放入 name、city、age 这三个字段；
+2. 从索引 city 找到第一个满足 city='杭州’条件的主键 id，也就是图中的 ID_X；
+3. 到主键 id 索引取出整行，取 name、city、age 三个字段的值，存入 sort_buffer 中；
+4. 从索引 city 取下一个记录的主键 id；
+5. 重复步骤 3、4 直到 city 的值不满足查询条件为止，对应的主键 id 也就是图中的 ID_Y；
+6. 对 sort_buffer 中的数据按照字段 name 做快速排序；
+7. 按照排序结果取前 1000 行返回给客户端。
+
+我们暂且把这个排序过程，称为**全字段排序**。
+
+**如果 MySQL 认为排序的单行长度太大会怎么做呢？**
+
+Mysql中有一个专门控制排序的**行数据的长度**的参数，单位是字节
+
+```mysql
+SET max_length_for_sort_data = 16;
+```
+
+name + city + age = 16 + 16 + 4 = 36 Bytes > 16 Bytes，此时放入 sort_buffer 的字段，只有要排序的列（即 name 字段）和主键 id。
+
+此时的执行流程：
+
+1. 初始化 sort_buffer，确定放入两个字段，即 name 和 id；
+2. 从索引 city 找到第一个满足 city='杭州’条件的主键 id，也就是图中的 ID_X；
+3. 到主键 id 索引取出整行，取 name、id 这两个字段，存入 sort_buffer 中；
+4. 从索引 city 取下一个记录的主键 id；
+5. 重复步骤 3、4 直到不满足 city='杭州’条件为止，也就是图中的 ID_Y；
+6. 对 sort_buffer 中的数据按照字段 name 进行排序；
+7. 遍历排序结果，取前 1000 行，并按照 id 的值回到原表中取出 city、name 和 age 三个字段返回给客户端。
+
+内存放不下时，就需要使用外部排序，**外部排序**一般使用**归并排序**算法。可以这么简单理解，MySQL 将需要排序的数据分成 n 份，每一份单独排序后存在这些临时文件中。然后把这 n 个有序文件再合并成一个有序的大文件。
+
+**如果索引是city、name**，此时的执行流程：
+
+1. 从索引 (city,name) 找到第一个满足 city='杭州’条件的主键 id；
+2. 到主键 id 索引取出整行，取 name、city、age 三个字段的值，作为结果集的一部分直接返回；
+3. 从索引 (city,name) 取下一个记录主键 id；
+4. 重复步骤 2、3，直到查到第 1000 条记录，或者是不满足 city='杭州’条件时循环结束。
+
+**如果索引是city、name、age**，此时的执行流程：
+
+1. 从索引 (city,name,age) 找到第一个满足 city='杭州’条件的记录，取出其中的 city、name 和 age 这三个字段的值，作为结果集的一部分直接返回；
+2. 从索引 (city,name,age) 取下一个记录，同样取出这三个字段的值，作为结果集的一部分直接返回；
+3. 重复执行步骤 2，直到查到第 1000 条记录，或者是不满足 city='杭州’条件时循环结束。
