@@ -706,3 +706,60 @@ name + city + age = 16 + 16 + 4 = 36 Bytes > 16 Bytes，此时放入 sort_buffer
 1. 从索引 (city,name,age) 找到第一个满足 city='杭州’条件的记录，取出其中的 city、name 和 age 这三个字段的值，作为结果集的一部分直接返回；
 2. 从索引 (city,name,age) 取下一个记录，同样取出这三个字段的值，作为结果集的一部分直接返回；
 3. 重复执行步骤 2，直到查到第 1000 条记录，或者是不满足 city='杭州’条件时循环结束。
+
+## 如何正确显示随机消息-单词软件随机三个单词
+
+建表 + 存储过程
+
+```mysql
+
+mysql> CREATE TABLE `words` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `word` varchar(64) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=0;
+  while i<10000 do
+    insert into words(word) values(concat(char(97+(i div 1000)), char(97+(i % 1000 div 100)), char(97+(i % 100 div 10)), char(97+(i % 10))));
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+
+call idata();
+```
+
+**方法一：order by rand() 使用内存临时表**
+
+```mysql
+select word from words order by rand() limit 3;
+```
+
+explain一下
+
+![](/image/33.png)
+
+Extra 字段显示 Using temporary，表示的是需要使用临时表；Using filesort，表示的是需要执行排序操作。
+
+即 **需要在临时表上排序！**
+
+- 对于InnoDB表来说，执行全字段排序会减少回表造成的磁盘访问，因此会被优先选择。
+- 而我们使用了内存临时表，回表就是访问内存而非磁盘，所以不会全字段排序，而是排序的行越小越好。
+
+这个语句的执行流程：
+
+1. 创建一个内存临时表，memory引擎，假设是double类型的R + varchar(64)类型的word
+2. 从words表中按主键顺序取出所有的word值，rand()得到的值存到R，word存到W
+3. 对内存临时表按照R排序
+4. 初始化sort_buffer，sort_buffer中有整型的row_id和浮点型的R
+5. 从内存临时表中取出row_id和R，存到sort_buffer
+6. 在sort_buffer中根据R排序
+7. 排序完成后，取出排序后的前三的row_id，然后从内存临时表中根据row_id找到对应的行
+
+总结：**order by rand() 使用了内存临时表，内存临时表排序的时候使用了 rowid 排序方法。**
+
