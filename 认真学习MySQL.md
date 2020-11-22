@@ -486,6 +486,18 @@ alter table SUser add index index2(email(6));
   select field_list from t where id_card_crc=crc32('input_id_card_string') and id_card='input_id_card_string‘
   ```
 
+## 什么情况下会用不到索引
+
+1. 对字段做了函数计算，就用不上索引了
+2. 隐式类型转换
+   where varchar = int，到底是左值转换成int，还是右值转换成varchar？
+   ![](image/34.png)
+   答案是**会将左值转换成int**。
+   ![](image/35.png)
+   看起来是**把varchar转成int,无论左右值**
+   ![](image/36.png)
+3. 隐式字符集编码转换，比如表A是utf8，表B是utf8mb4，这样在where A.name=B.userName时会对A.Name作CONVERT(A.Name USING utf8mb4)，这是一个函数操作，按照函数操作不走索引的规则，这个也用户到索引。
+
 # 锁
 
 ## 全局锁
@@ -517,9 +529,16 @@ MySQL 里面表级别的锁有两种：一种是表锁，一种是元数据锁�
 
 **另一类表级的锁是 MDL（metadata lock)**。MDL 不需要显式使用，在访问一个表的时候会被自动加上。MDL 的作用是，保证读写的正确性。你可以想象一下，如果一个查询正在遍历一个表中的数据，而执行期间另一个线程对这个表结构做变更，删了一列，那么查询线程拿到的结果跟表结构对不上，肯定是不行的。
 
-MDL写锁：更改表结构时，加MDL写锁
+**MDL写锁**：更改表结构时，加MDL写锁，例如：
 
-MDL读锁：增删改查都加MDL读锁
+![](image/37.png)
+可以查到阻塞select语句的pid
+![](image/38.png)
+kill 掉连接![](image/39.png)
+发现查询返回了结果，原来加MDL写锁的connection需要重连
+![](image/40.png)
+
+**MDL读锁**：增删改查都加MDL读锁
 
 ![](image/8.png)
 
@@ -566,6 +585,18 @@ ALTER TABLE tbl_name WAIT N add column ...
 
 MySQL8.0.21亲测无效
 
+**为什么只查一行的语句执行的很慢？**
+
+1. 等MDL锁
+
+2. 等flush，flush在正常情况下执行的很快，但可能出现其他语句堵住flush的情况
+
+3. 查询慢
+   ![](image/41.png)
+
+   `select * from t where id = 1`要比`select * from t where id = 1 lock in share mode`慢很多，因为带 lock in share mode 的 SQL 语句，是当前读，因此会直接读到 1000001 这个结果，所以速度很快；而 select * from t where id=1 这个语句，是一致性读，因此需要从 1000001 开始，依次执行 undo log，执行了 100 万次以后，才将 1 这个结果返回。
+   <img src="image/42.png" style="zoom: 50%;" />
+
 ## 行锁
 
 在 InnoDB 事务中，行锁是在需要的时候才加上的，但并不是不需要了就立刻释放，而是要等到事务结束时才释放。这个就是**两阶段锁协议**。
@@ -587,13 +618,89 @@ MySQL8.0.21亲测无效
 
 你可以考虑通过将一行改成逻辑上的多行来减少锁冲突。还是以影院账户为例，可以考虑放在多条记录上，比如 10 个记录，影院的账户总额等于这 10 个记录的值的总和。这样每次要给影院账户加金额的时候，随机选其中一条记录来加。这样每次冲突概率变成原来的 1/10，可以减少锁等待个数，也就减少了死锁检测的 CPU 消耗。
 
+## select lock in share mode 和 select for update
+
+### lock in share mode加读锁
+
+在能用上索引的情况下加的是行锁：
+
+![](image/45.png)
+
+用不到索引的情况下加的是表锁：
+
+![](image/46.png)
+
+### for update加写锁
+
+能用上索引就是行锁
+
+![](image/47.png)
+
+用不上索引就是表锁
+
+![](image/48.png)
+
+结论：**有索引加行锁，没索引加表锁**。推论：**锁是加在索引上的**。
+
+### LOCK IN SHARE MODE 有什么用？
+
+**两张表的数据一致**
+
+一个表是child表，一个是parent表，假设child表的某一列child_id映射到parent表的c_child_id列，那么从业务角度讲，此时我直接insert一条child_id=100记录到child表是存在风险的，因为刚insert的时候可能在parent表里删除了这条c_child_id=100的记录，那么业务数据就存在不一致的风险。正确的方法是再插入时执行select * from parent where c_child_id=100 lock in share mode,锁定了parent表的这条记录，然后执行insert into child(child_id) values (100)就ok了。
+
+### FOR UPDATE 有什么用？
+
+**一张表的数据一致**
+
+电商系统中计算一种商品的剩余数量，在产生订单之前需要确认商品数量>=1,产生订单之后应该将商品数量减1。
+
+如果：
+
+```mysql
+select amount from product where product_name='XX';
+update product set amount=amount-1 where product_name='XX';
+```
+
+可能在事务A在第一条语句执行完时，事务B执行了第二条语句，那么事务A再执行第二条语句就会导致数据不一致。
+
+那么，**LOCK IN SHARE MODE 可行吗？**
+
+事务A在第一条语句执行完时，事务B的第二条语句也可以执行下去，那么事务A再执行第二条语句就会阻塞（因为事务B获取到了读锁）
+
+![](image/50.png)
+
+事务B执行第二条语句会死锁。
+
+![](image/52.png)
+
+**使用for update**，事务B在select时就被堵住，事务A提交后，B就可以继续执行
+
+![](image/53.png)
+
+## S锁、X锁、IS锁、IX锁
+
+IS锁和IX锁是意向锁，表达一个事务想要获取什么，在加行锁或表锁之前要都加意向锁，**意向锁是表级锁**。
+
+不会和行级的S锁，X锁冲突，只会和表级的S锁，X锁冲突。
+
+![](image/49.png)
+
+意向锁的作用：协调行锁和表锁的关系，提升加表锁时的性能。
+
+假设有一张1w条记录的表，有一行上了**行写锁**，**在上行X锁之前就上了IX锁**，在请求**表S锁**时，就会直接判断为阻塞。如果没有IX锁，加表S锁时则需要逐行判断S锁。
+
+IS锁同理。
+
+- 意向共享锁和意向排他锁都是系统自动添加和自动释放的，整个过程无需人工干预
+- 由于InnoDB存储引擎支持的是行级别的锁，因此意向锁不会阻塞除全表扫描以外的任何请求。
+
 # 实现原理
 
 ## count(*)
 
 不同的 MySQL 引擎中，count(*) 有不同的实现方式。
 
-- MyISAM 引擎把一个表的总行数存在了磁盘上，因此执行 count(*) 的时候会直接返回这个数，效率很高；
+- MsyISAM 引擎把一个表的总行数存在了磁盘上，因此执行 count(*) 的时候会直接返回这个数，效率很高；
 - 而 InnoDB 引擎就麻烦了，它执行 count(*) 的时候，需要把数据一行一行地从引擎里面读出来，然后累积计数。
 
 如果加了 where 条件的话，MyISAM 表也是不能返回得这么快的。
